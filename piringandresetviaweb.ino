@@ -1,32 +1,195 @@
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
-#define EEPROM_SIZE 96   // 32 byte SSID + 64 byte PASS
+#define EEPROM_SIZE 1024
+#define CONFIG_MAGIC 0xA5
+#define CONFIG_VERSION 1
 
 ESP8266WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-const char* mqttHost = "faizabdul.xyz";
-const uint16_t mqttPort = 1883;
+const char* API_ACTIVATE_URL = "https://solder.id/apici/index.php/device/activate";
+
+// Hardware identity: harus unik per device saat produksi.
+const char* HW_DEVICE_ID = "ESP32-001";
+const char* HW_USERNAME = "esp32_user_001";
+const char* HW_PASSWORD = "esp-secret-001";
+
+const char* mqttHostFallback = "faizabdul.xyz";
+const uint16_t mqttPortFallback = 1883;
 const char* mqttUser = "robot";
 const char* mqttPass = "bismillah";
-const char* mqttTopicPing = "testTopic/ping";
-const char* mqttTopicPong = "testTopic/pong";
+
+struct DeviceConfig {
+  uint8_t magic;
+  uint8_t version;
+  char ssid[33];
+  char pass[65];
+  char pairToken[65];
+  char mqttHost[65];
+  uint16_t mqttPort;
+  char mqttClientId[65];
+  char mqttTopicPing[129];
+  char mqttTopicPong[129];
+  uint8_t isPaired;
+};
+
+DeviceConfig cfg;
 
 unsigned long lastPingMs = 0;
+unsigned long lastActivationAttemptMs = 0;
+const int WIFI_CONNECT_RETRIES = 60;  // 60 x 500ms = 30s
+
+bool isExternalResetButtonPress() {
+  String reason = ESP.getResetReason();
+  reason.toLowerCase();
+  return reason.indexOf("external") >= 0;
+}
+
+const char* wifiStatusToText(int status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "WL_IDLE_STATUS";
+    case WL_NO_SSID_AVAIL:
+      return "WL_NO_SSID_AVAIL";
+    case WL_SCAN_COMPLETED:
+      return "WL_SCAN_COMPLETED";
+    case WL_CONNECTED:
+      return "WL_CONNECTED";
+    case WL_CONNECT_FAILED:
+      return "WL_CONNECT_FAILED";
+    case WL_CONNECTION_LOST:
+      return "WL_CONNECTION_LOST";
+    case WL_DISCONNECTED:
+      return "WL_DISCONNECTED";
+    default:
+      return "WL_UNKNOWN";
+  }
+}
+
+String jsonExtractString(const String& json, const String& key) {
+  int keyPos = json.indexOf("\"" + key + "\"");
+  if (keyPos < 0) {
+    return "";
+  }
+
+  int colonPos = json.indexOf(':', keyPos);
+  if (colonPos < 0) {
+    return "";
+  }
+
+  int i = colonPos + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) {
+    i++;
+  }
+
+  if (i >= (int)json.length() || json[i] != '"') {
+    return "";
+  }
+  i++;
+
+  int start = i;
+  while (i < (int)json.length()) {
+    if (json[i] == '"' && json[i - 1] != '\\') {
+      break;
+    }
+    i++;
+  }
+
+  if (i >= (int)json.length()) {
+    return "";
+  }
+
+  return json.substring(start, i);
+}
+
+long jsonExtractNumber(const String& json, const String& key, long defaultValue) {
+  int keyPos = json.indexOf("\"" + key + "\"");
+  if (keyPos < 0) {
+    return defaultValue;
+  }
+
+  int colonPos = json.indexOf(':', keyPos);
+  if (colonPos < 0) {
+    return defaultValue;
+  }
+
+  int i = colonPos + 1;
+  while (i < (int)json.length() && (json[i] == ' ' || json[i] == '\n' || json[i] == '\r' || json[i] == '\t')) {
+    i++;
+  }
+
+  int start = i;
+  while (i < (int)json.length() && (isDigit(json[i]) || json[i] == '-')) {
+    i++;
+  }
+
+  if (start == i) {
+    return defaultValue;
+  }
+
+  return json.substring(start, i).toInt();
+}
+
+bool jsonContainsTrue(const String& json, const String& key) {
+  int keyPos = json.indexOf("\"" + key + "\"");
+  if (keyPos < 0) {
+    return false;
+  }
+
+  int colonPos = json.indexOf(':', keyPos);
+  if (colonPos < 0) {
+    return false;
+  }
+
+  String rest = json.substring(colonPos + 1);
+  rest.trim();
+  return rest.startsWith("true");
+}
+
+void clearConfig() {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = CONFIG_MAGIC;
+  cfg.version = CONFIG_VERSION;
+  cfg.mqttPort = mqttPortFallback;
+}
+
+void saveConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t* raw = (uint8_t*)&cfg;
+  for (unsigned int i = 0; i < sizeof(cfg); i++) {
+    EEPROM.write(i, raw[i]);
+  }
+  EEPROM.commit();
+}
+
+void loadConfig() {
+  EEPROM.begin(EEPROM_SIZE);
+  uint8_t* raw = (uint8_t*)&cfg;
+  for (unsigned int i = 0; i < sizeof(cfg); i++) {
+    raw[i] = EEPROM.read(i);
+  }
+
+  if (cfg.magic != CONFIG_MAGIC || cfg.version != CONFIG_VERSION) {
+    clearConfig();
+    saveConfig();
+  }
+}
 
 void publishMqtt(const char* payload) {
   if (!mqttClient.connected()) {
     return;
   }
-  mqttClient.publish(mqttTopicPing, payload);
+  mqttClient.publish(cfg.mqttTopicPing, payload);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, mqttTopicPong) != 0) {
+  if (strcmp(topic, cfg.mqttTopicPong) != 0) {
     return;
   }
 
@@ -46,15 +209,27 @@ void connectMqtt() {
     return;
   }
 
+  if (!cfg.isPaired || strlen(cfg.mqttTopicPing) == 0 || strlen(cfg.mqttTopicPong) == 0) {
+    return;
+  }
+
+  const char* host = strlen(cfg.mqttHost) > 0 ? cfg.mqttHost : mqttHostFallback;
+  uint16_t port = cfg.mqttPort > 0 ? cfg.mqttPort : mqttPortFallback;
+  mqttClient.setServer(host, port);
+  mqttClient.setCallback(mqttCallback);
+
   while (!mqttClient.connected()) {
-    String clientId = "esp8266-" + String(ESP.getChipId(), HEX);
+    String clientId = strlen(cfg.mqttClientId) > 0
+      ? String(cfg.mqttClientId)
+      : "esp8266-" + String(ESP.getChipId(), HEX);
+
     Serial.print("Connecting MQTT...");
 
     bool ok = mqttClient.connect(
       clientId.c_str(),
       mqttUser,
       mqttPass,
-      mqttTopicPing,
+      cfg.mqttTopicPing,
       1,
       true,
       "berhenti"
@@ -62,7 +237,7 @@ void connectMqtt() {
 
     if (ok) {
       Serial.println("connected");
-      mqttClient.subscribe(mqttTopicPong);
+      mqttClient.subscribe(cfg.mqttTopicPong);
       publishMqtt("ping");
       Serial.println("MQTT send: ping");
       break;
@@ -81,35 +256,83 @@ void setupWebRoutes() {
   server.on("/reset", handleReset);
 }
 
-void saveCredentials(const char* ssid, const char* pass) {
-  EEPROM.begin(EEPROM_SIZE);
-  for (int i = 0; i < 32; i++) {
-    EEPROM.write(i, i < strlen(ssid) ? ssid[i] : 0);
+bool activateDevice() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
   }
-  for (int i = 0; i < 64; i++) {
-    EEPROM.write(32 + i, i < strlen(pass) ? pass[i] : 0);
-  }
-  EEPROM.commit();
-}
 
-void loadCredentials(char* ssid, char* pass) {
-  EEPROM.begin(EEPROM_SIZE);
-  for (int i = 0; i < 32; i++) {
-    ssid[i] = char(EEPROM.read(i));
+  if (strlen(cfg.pairToken) == 0) {
+    Serial.println("No pair token. Skip activation.");
+    return false;
   }
-  ssid[31] = '\0';
-  for (int i = 0; i < 64; i++) {
-    pass[i] = char(EEPROM.read(32 + i));
-  }
-  pass[63] = '\0';
-}
 
-void clearCredentials() {
-  EEPROM.begin(EEPROM_SIZE);
-  for (int i = 0; i < EEPROM_SIZE; i++) {
-    EEPROM.write(i, 0);
+  Serial.println("Activating device to API...");
+
+  WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient https;
+  if (!https.begin(secureClient, API_ACTIVATE_URL)) {
+    Serial.println("HTTPS begin failed");
+    return false;
   }
-  EEPROM.commit();
+
+  https.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"pair_token\":\"" + String(cfg.pairToken) + "\",";
+  payload += "\"device_id\":\"" + String(HW_DEVICE_ID) + "\",";
+  payload += "\"hardware_username\":\"" + String(HW_USERNAME) + "\",";
+  payload += "\"hardware_password\":\"" + String(HW_PASSWORD) + "\"";
+  payload += "}";
+
+  int code = https.POST(payload);
+  String body = https.getString();
+  https.end();
+
+  Serial.print("Activate status: ");
+  Serial.println(code);
+  Serial.println(body);
+
+  if (code < 200 || code >= 300) {
+    return false;
+  }
+
+  if (!jsonContainsTrue(body, "status")) {
+    return false;
+  }
+
+  String host = jsonExtractString(body, "host");
+  String clientId = jsonExtractString(body, "client_id");
+  String topicPing = jsonExtractString(body, "ping");
+  String topicPong = jsonExtractString(body, "pong");
+  long port = jsonExtractNumber(body, "port", mqttPortFallback);
+
+  if (topicPing.length() == 0 || topicPong.length() == 0) {
+    Serial.println("Activation response missing topics");
+    return false;
+  }
+
+  memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
+  memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
+  memset(cfg.mqttTopicPong, 0, sizeof(cfg.mqttTopicPong));
+
+  if (host.length() > 0) {
+    host.toCharArray(cfg.mqttHost, sizeof(cfg.mqttHost));
+  }
+  if (clientId.length() > 0) {
+    clientId.toCharArray(cfg.mqttClientId, sizeof(cfg.mqttClientId));
+  }
+
+  topicPing.toCharArray(cfg.mqttTopicPing, sizeof(cfg.mqttTopicPing));
+  topicPong.toCharArray(cfg.mqttTopicPong, sizeof(cfg.mqttTopicPong));
+  cfg.mqttPort = (uint16_t)port;
+  cfg.isPaired = 1;
+
+  saveConfig();
+  Serial.println("Activation success. MQTT contract saved.");
+  return true;
 }
 
 void handleRoot() {
@@ -117,6 +340,7 @@ void handleRoot() {
                 "<form method='POST' action='/save'>"
                 "SSID: <input name='ssid'><br>"
                 "Password: <input name='pass' type='password'><br><br>"
+                "Pair Token: <input name='pair_token'><br><br>"
                 "<input type='submit' value='Save WiFi'>"
                 "</form>"
                 "<br><br>"
@@ -127,16 +351,41 @@ void handleRoot() {
 void handleSave() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
+  String pairToken = server.arg("pair_token");
+
+  ssid.trim();
+  pass.trim();
+  pairToken.trim();
+
+  if (ssid.length() == 0) {
+    server.send(400, "text/plain", "SSID is required");
+    return;
+  }
+
+  memset(cfg.ssid, 0, sizeof(cfg.ssid));
+  memset(cfg.pass, 0, sizeof(cfg.pass));
+  memset(cfg.pairToken, 0, sizeof(cfg.pairToken));
+  memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
+  memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
+  memset(cfg.mqttTopicPong, 0, sizeof(cfg.mqttTopicPong));
+
+  ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+  pass.toCharArray(cfg.pass, sizeof(cfg.pass));
+  pairToken.toCharArray(cfg.pairToken, sizeof(cfg.pairToken));
+  cfg.mqttPort = mqttPortFallback;
+  cfg.isPaired = 0;
 
   server.send(200, "text/plain", "Saved! Rebooting...");
 
-  saveCredentials(ssid.c_str(), pass.c_str());
+  saveConfig();
   delay(1000);
   ESP.restart();
 }
 
 void handleReset() {
-  clearCredentials();
+  clearConfig();
+  saveConfig();
   server.send(200, "text/plain", "WiFi credentials cleared! Rebooting...");
   delay(1000);
   ESP.restart();
@@ -168,19 +417,32 @@ void setup() {
   Serial.println();
   Serial.println("Booting...");
 
-  char ssid[32];
-  char pass[64];
-  loadCredentials(ssid, pass);
+  if (isExternalResetButtonPress()) {
+    Serial.println("External reset detected. Running factory reset logic...");
+    clearConfig();
+    saveConfig();
+  }
 
-  if (strlen(ssid) > 0) {
+  loadConfig();
+
+  if (strlen(cfg.ssid) > 0) {
     Serial.print("Trying to connect to saved WiFi: ");
-    Serial.println(ssid);
+    Serial.println(cfg.ssid);
 
-    WiFi.begin(ssid, pass);
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(cfg.ssid, cfg.pass);
+
     int retries = 0;
-    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+    while (WiFi.status() != WL_CONNECTED && retries < WIFI_CONNECT_RETRIES) {
       delay(500);
       Serial.print(".");
+      if ((retries + 1) % 10 == 0) {
+        Serial.print(" [");
+        Serial.print(wifiStatusToText(WiFi.status()));
+        Serial.print("]");
+      }
       retries++;
     }
 
@@ -189,8 +451,10 @@ void setup() {
       Serial.print("IP Address: ");
       Serial.println(WiFi.localIP());
 
-      mqttClient.setServer(mqttHost, mqttPort);
-      mqttClient.setCallback(mqttCallback);
+      if (!cfg.isPaired && strlen(cfg.pairToken) > 0) {
+        activateDevice();
+      }
+
       connectMqtt();
 
       // tetap aktifkan web server agar bisa reset / save meskipun sudah connect
@@ -198,6 +462,10 @@ void setup() {
       server.begin();
       return;
     }
+
+    Serial.println();
+    Serial.print("WiFi connect failed. Last status: ");
+    Serial.println(wifiStatusToText(WiFi.status()));
   }
 
   // kalau gagal connect, masuk AP
@@ -208,6 +476,11 @@ void loop() {
   server.handleClient(); // selalu layani web server
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (!cfg.isPaired && strlen(cfg.pairToken) > 0 && (millis() - lastActivationAttemptMs >= 10000)) {
+      lastActivationAttemptMs = millis();
+      activateDevice();
+    }
+
     if (!mqttClient.connected()) {
       connectMqtt();
     }
