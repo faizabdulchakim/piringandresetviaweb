@@ -234,8 +234,8 @@ void handleMqttCommand(const String& commandPayload) {
   Serial.println(commandPayload);
 
   if (action == "clear_pairing_history" || action == "clear_pairing" || action == "reset_connection") {
-    publishCommandResponse(action, "ok", "Clearing pairing history");
-    clearPairingHistoryOnly();
+    publishCommandResponse(action, "ok", "Clearing pairing history and WiFi credentials");
+    clearConfig();
     saveConfig();
     delay(1000);
     ESP.restart();
@@ -474,9 +474,9 @@ void handleReset() {
 }
 
 void handleClearPairingHistory() {
-  clearPairingHistoryOnly();
+  clearConfig();
   saveConfig();
-  server.send(200, "text/plain", "Pairing history cleared! Rebooting...");
+  server.send(200, "text/plain", "Pairing history and WiFi credentials cleared! Rebooting...");
   delay(1000);
   ESP.restart();
 }
