@@ -34,6 +34,8 @@ struct DeviceConfig {
   char mqttHost[65];
   uint16_t mqttPort;
   char mqttClientId[65];
+  char mqttTopicCmd[129];
+  char mqttTopicRes[129];
   char mqttTopicPing[129];
   char mqttTopicPong[129];
   uint8_t isPaired;
@@ -159,6 +161,18 @@ void clearConfig() {
   cfg.mqttPort = mqttPortFallback;
 }
 
+void clearPairingHistoryOnly() {
+  memset(cfg.pairToken, 0, sizeof(cfg.pairToken));
+  memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
+  memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
+  memset(cfg.mqttTopicRes, 0, sizeof(cfg.mqttTopicRes));
+  memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
+  memset(cfg.mqttTopicPong, 0, sizeof(cfg.mqttTopicPong));
+  cfg.isPaired = 0;
+  cfg.mqttPort = mqttPortFallback;
+}
+
 void saveConfig() {
   EEPROM.begin(EEPROM_SIZE);
   uint8_t* raw = (uint8_t*)&cfg;
@@ -188,20 +202,77 @@ void publishMqtt(const char* payload) {
   mqttClient.publish(cfg.mqttTopicPing, payload);
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  if (strcmp(topic, cfg.mqttTopicPong) != 0) {
+void publishMqttToTopic(const char* topic, const String& payload, bool retain = false) {
+  if (!mqttClient.connected() || topic == nullptr || strlen(topic) == 0) {
+    return;
+  }
+  mqttClient.publish(topic, payload.c_str(), retain);
+}
+
+void publishCommandResponse(const String& action, const String& status, const String& detail = "") {
+  if (strlen(cfg.mqttTopicRes) == 0) {
     return;
   }
 
+  String payload = "{";
+  payload += "\"action\":\"" + action + "\",";
+  payload += "\"status\":\"" + status + "\",";
+  payload += "\"detail\":\"" + detail + "\"";
+  payload += "}";
+  publishMqttToTopic(cfg.mqttTopicRes, payload, false);
+}
+
+void handleMqttCommand(const String& commandPayload) {
+  String action = jsonExtractString(commandPayload, "action");
+  if (action.length() == 0) {
+    action = commandPayload;
+  }
+  action.trim();
+  action.toLowerCase();
+
+  Serial.print("MQTT command payload: ");
+  Serial.println(commandPayload);
+
+  if (action == "clear_pairing_history" || action == "clear_pairing" || action == "reset_connection") {
+    publishCommandResponse(action, "ok", "Clearing pairing history");
+    clearPairingHistoryOnly();
+    saveConfig();
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+
+  if (action == "factory_reset" || action == "reset_all") {
+    publishCommandResponse(action, "ok", "Factory reset");
+    clearConfig();
+    saveConfig();
+    delay(1000);
+    ESP.restart();
+    return;
+  }
+
+  publishCommandResponse(action, "error", "Unknown action");
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
   for (unsigned int i = 0; i < length; i++) {
     msg += (char)payload[i];
   }
   msg.trim();
-  msg.toLowerCase();
 
   Serial.print("MQTT recv: ");
   Serial.println(msg);
+
+  if (strlen(cfg.mqttTopicCmd) > 0 && strcmp(topic, cfg.mqttTopicCmd) == 0) {
+    handleMqttCommand(msg);
+    return;
+  }
+
+  if (strlen(cfg.mqttTopicPong) > 0 && strcmp(topic, cfg.mqttTopicPong) == 0) {
+    msg.toLowerCase();
+    Serial.println("MQTT pong received");
+  }
 }
 
 void connectMqtt() {
@@ -209,7 +280,7 @@ void connectMqtt() {
     return;
   }
 
-  if (!cfg.isPaired || strlen(cfg.mqttTopicPing) == 0 || strlen(cfg.mqttTopicPong) == 0) {
+  if (!cfg.isPaired || strlen(cfg.mqttTopicCmd) == 0) {
     return;
   }
 
@@ -237,6 +308,7 @@ void connectMqtt() {
 
     if (ok) {
       Serial.println("connected");
+      mqttClient.subscribe(cfg.mqttTopicCmd);
       mqttClient.subscribe(cfg.mqttTopicPong);
       publishMqtt("ping");
       Serial.println("MQTT send: ping");
@@ -254,6 +326,7 @@ void setupWebRoutes() {
   server.on("/", handleRoot);
   server.on("/save", handleSave);
   server.on("/reset", handleReset);
+  server.on("/clear_pairing_history", handleClearPairingHistory);
 }
 
 bool activateDevice() {
@@ -304,17 +377,21 @@ bool activateDevice() {
 
   String host = jsonExtractString(body, "host");
   String clientId = jsonExtractString(body, "client_id");
+  String topicCmd = jsonExtractString(body, "cmd");
+  String topicRes = jsonExtractString(body, "res");
   String topicPing = jsonExtractString(body, "ping");
   String topicPong = jsonExtractString(body, "pong");
   long port = jsonExtractNumber(body, "port", mqttPortFallback);
 
-  if (topicPing.length() == 0 || topicPong.length() == 0) {
+  if (topicCmd.length() == 0 || topicPing.length() == 0 || topicPong.length() == 0) {
     Serial.println("Activation response missing topics");
     return false;
   }
 
   memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
   memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
+  memset(cfg.mqttTopicRes, 0, sizeof(cfg.mqttTopicRes));
   memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
   memset(cfg.mqttTopicPong, 0, sizeof(cfg.mqttTopicPong));
 
@@ -324,6 +401,9 @@ bool activateDevice() {
   if (clientId.length() > 0) {
     clientId.toCharArray(cfg.mqttClientId, sizeof(cfg.mqttClientId));
   }
+
+  topicCmd.toCharArray(cfg.mqttTopicCmd, sizeof(cfg.mqttTopicCmd));
+  topicRes.toCharArray(cfg.mqttTopicRes, sizeof(cfg.mqttTopicRes));
 
   topicPing.toCharArray(cfg.mqttTopicPing, sizeof(cfg.mqttTopicPing));
   topicPong.toCharArray(cfg.mqttTopicPong, sizeof(cfg.mqttTopicPong));
@@ -367,6 +447,8 @@ void handleSave() {
   memset(cfg.pairToken, 0, sizeof(cfg.pairToken));
   memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
   memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
+  memset(cfg.mqttTopicRes, 0, sizeof(cfg.mqttTopicRes));
   memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
   memset(cfg.mqttTopicPong, 0, sizeof(cfg.mqttTopicPong));
 
@@ -387,6 +469,14 @@ void handleReset() {
   clearConfig();
   saveConfig();
   server.send(200, "text/plain", "WiFi credentials cleared! Rebooting...");
+  delay(1000);
+  ESP.restart();
+}
+
+void handleClearPairingHistory() {
+  clearPairingHistoryOnly();
+  saveConfig();
+  server.send(200, "text/plain", "Pairing history cleared! Rebooting...");
   delay(1000);
   ESP.restart();
 }
