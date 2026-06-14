@@ -7,11 +7,281 @@
 
 #define EEPROM_SIZE 1024
 #define CONFIG_MAGIC 0xA5
-#define CONFIG_VERSION 3
+#define CONFIG_VERSION 4
+
+// ==========================================
+// CLASS WRAPPER: WEBSOCKET SECURE (WSS)
+// ==========================================
+class WSSMqttClient : public Client {
+private:
+    WiFiClientSecure client;
+    const char* host;
+    uint16_t port;
+    const char* path;
+    bool connected_ws = false;
+
+    // Ring Buffer untuk menampung data payload WebSocket yang masuk
+    uint8_t* rxBuf = nullptr;
+    const size_t rxBufSize = 1024;
+    size_t rxHead = 0; // Pointer tulis
+    size_t rxTail = 0; // Pointer baca
+
+    // Mengirim frame biner WebSocket (opcode 0x02) ke Broker
+    void sendFrame(const uint8_t* data, size_t len) {
+        if (!client.connected()) return;
+
+        // Header Frame: FIN (1) + Opcode Biner (2) = 0x82
+        uint8_t header = 0x82;
+        client.write(&header, 1);
+
+        // Masking key (wajib untuk data dari Client ke Server)
+        uint8_t mask[4] = { 
+            (uint8_t)random(256), 
+            (uint8_t)random(256), 
+            (uint8_t)random(256), 
+            (uint8_t)random(256) 
+        };
+
+        if (len < 126) {
+            uint8_t lenByte = 0x80 | (uint8_t)len;
+            client.write(&lenByte, 1);
+        } else if (len <= 65535) {
+            uint8_t lenByte = 0x80 | 126;
+            client.write(&lenByte, 1);
+            uint8_t lenBytes[2] = {
+                (uint8_t)(len >> 8),
+                (uint8_t)(len & 0xFF)
+            };
+            client.write(lenBytes, 2);
+        } else {
+            return; // Payload terlalu besar
+        }
+
+        client.write(mask, 4);
+
+        // Lakukan masking ke data sebelum dikirim
+        uint8_t* masked = (uint8_t*)malloc(len);
+        if (masked) {
+            for (size_t i = 0; i < len; i++) {
+                masked[i] = data[i] ^ mask[i % 4];
+            }
+            client.write(masked, len);
+            free(masked);
+        }
+    }
+
+    // Melakukan handshake HTTP Upgrade ke WebSocket
+    bool performHandshake() {
+        if (path == nullptr) return false;
+        String pathStr = String(path);
+        if (!pathStr.startsWith("/")) {
+            pathStr = "/" + pathStr;
+        }
+
+        String req = "GET " + pathStr + " HTTP/1.1\r\n";
+        req += "Host: " + String(host) + ":" + String(port) + "\r\n";
+        req += "Upgrade: websocket\r\n";
+        req += "Connection: Upgrade\r\n";
+        req += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"; // Kunci statis standar
+        req += "Sec-WebSocket-Protocol: mqtt\r\n"; // Menggunakan sub-protokol mqtt
+        req += "Sec-WebSocket-Version: 13\r\n\r\n";
+
+        client.print(req);
+
+        // Baca header respons
+        unsigned long start = millis();
+        String response = "";
+        while (client.connected() && millis() - start < 5000) {
+            if (client.available()) {
+                char c = client.read();
+                response += c;
+                if (response.endsWith("\r\n\r\n")) {
+                    break;
+                }
+            }
+            yield();
+        }
+
+        // Cek status code 101 Switching Protocols
+        if (response.indexOf("101 Switching Protocols") >= 0 || response.indexOf("101 ") >= 0) {
+            connected_ws = true;
+            rxHead = 0;
+            rxTail = 0;
+            return true;
+        }
+
+        client.stop();
+        return false;
+    }
+
+    // Membaca stream TCP dan mengekstrak payload dari frame WebSocket
+    void parseIncoming() {
+        if (!client.connected()) {
+            connected_ws = false;
+            return;
+        }
+
+        while (client.available() >= 2) {
+            uint8_t header = client.read();
+            uint8_t lenByte = client.read();
+
+            uint8_t opcode = header & 0x0F;
+            bool masked = (lenByte & 0x80) != 0;
+            uint32_t payloadLen = lenByte & 0x7F;
+
+            if (payloadLen == 126) {
+                unsigned long start = millis();
+                while (client.available() < 2) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                payloadLen = (client.read() << 8) | client.read();
+            } else if (payloadLen == 127) {
+                unsigned long start = millis();
+                while (client.available() < 8) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                payloadLen = 0;
+                for (int i = 0; i < 8; i++) {
+                    payloadLen = (payloadLen << 8) | client.read();
+                }
+            }
+
+            uint8_t maskKey[4] = {0};
+            if (masked) {
+                unsigned long start = millis();
+                while (client.available() < 4) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                client.read(maskKey, 4);
+            }
+
+            // Baca payload data
+            for (uint32_t i = 0; i < payloadLen; i++) {
+                unsigned long start = millis();
+                while (!client.available()) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                uint8_t val = client.read();
+                if (masked) {
+                    val ^= maskKey[i % 4];
+                }
+
+                // Masukkan data frame text/binary/continuation ke dalam ring buffer baca
+                if (opcode == 0x00 || opcode == 0x01 || opcode == 0x02) {
+                    size_t nextHead = (rxHead + 1) % rxBufSize;
+                    if (nextHead != rxTail) {
+                        rxBuf[rxHead] = val;
+                        rxHead = nextHead;
+                    }
+                }
+            }
+
+            // Tangani frame khusus WebSocket
+            if (opcode == 0x08) { // Frame Close
+                connected_ws = false;
+                client.stop();
+                return;
+            } else if (opcode == 0x09) { // Frame Ping -> Jawab dengan Pong
+                uint8_t pongFrame[2] = { 0x8A, 0x00 };
+                client.write(pongFrame, 2);
+            }
+        }
+    }
+
+public:
+    WSSMqttClient(const char* h, uint16_t p, const char* pathStr) 
+      : host(h), port(p), path(pathStr) {
+        rxBuf = (uint8_t*)malloc(rxBufSize);
+        
+        // Lewati verifikasi sertifikat root CA
+        // Ini menghindari perlunya sinkronisasi waktu lewat NTP.
+        client.setInsecure();
+    }
+
+    ~WSSMqttClient() {
+        if (rxBuf) free(rxBuf);
+    }
+
+    void setDestination(const char* h, uint16_t p, const char* pathStr) {
+        host = h;
+        port = p;
+        path = pathStr;
+    }
+
+    int connect(IPAddress ip, uint16_t port) override { return 0; }
+    int connect(const char *host, uint16_t port) override {
+        connected_ws = false;
+        this->host = host;
+        this->port = port;
+        if (client.connect(host, port)) {
+            return performHandshake() ? 1 : 0;
+        }
+        return 0;
+    }
+
+    size_t write(uint8_t b) override {
+        return write(&b, 1);
+    }
+
+    size_t write(const uint8_t *buf, size_t size) override {
+        sendFrame(buf, size);
+        return size;
+    }
+
+    int available() override {
+        parseIncoming();
+        return (rxHead >= rxTail) ? (rxHead - rxTail) : (rxBufSize - rxTail + rxHead);
+    }
+
+    int read() override {
+        parseIncoming();
+        if (rxHead == rxTail) return -1;
+        uint8_t val = rxBuf[rxTail];
+        rxTail = (rxTail + 1) % rxBufSize;
+        return val;
+    }
+
+    int read(uint8_t *buf, size_t size) override {
+        size_t bytesRead = 0;
+        while (bytesRead < size) {
+            int val = read();
+            if (val == -1) break;
+            buf[bytesRead++] = (uint8_t)val;
+        }
+        return bytesRead;
+    }
+
+    int peek() override {
+        parseIncoming();
+        if (rxHead == rxTail) return -1;
+        return rxBuf[rxTail];
+    }
+
+    void flush() override {
+        client.flush();
+    }
+
+    void stop() override {
+        connected_ws = false;
+        client.stop();
+    }
+
+    uint8_t connected() override {
+        return (client.connected() && connected_ws) ? 1 : 0;
+    }
+
+    operator bool() override {
+        return connected() == 1;
+    }
+};
 
 ESP8266WebServer server(80);
-WiFiClient espClient;
-PubSubClient mqttClient(espClient);
+WSSMqttClient wssClient(nullptr, 0, nullptr);
+PubSubClient mqttClient(wssClient);
 
 const char* API_ACTIVATE_URL = "";
 
@@ -24,6 +294,7 @@ const char* mqttHostFallback = "";
 const uint16_t mqttPortFallback = 1883;
 const char* mqttUser = "";
 const char* mqttPass = "";
+const char* mqttBasepathFallback = "mqtt";
 
 struct DeviceConfig {
   uint8_t magic;
@@ -42,6 +313,7 @@ struct DeviceConfig {
   char apiUrl[129];
   char mqttUser[33];
   char mqttPass[65];
+  char mqttPath[65];
 };
 
 DeviceConfig cfg;
@@ -289,9 +561,11 @@ void connectMqtt() {
 
   const char* host = strlen(cfg.mqttHost) > 0 ? cfg.mqttHost : mqttHostFallback;
   uint16_t port = cfg.mqttPort > 0 ? cfg.mqttPort : mqttPortFallback;
+  const char* path = strlen(cfg.mqttPath) > 0 ? cfg.mqttPath : mqttBasepathFallback;
   const char* mUser = strlen(cfg.mqttUser) > 0 ? cfg.mqttUser : mqttUser;
   const char* mPass = strlen(cfg.mqttPass) > 0 ? cfg.mqttPass : mqttPass;
 
+  wssClient.setDestination(host, port, path);
   mqttClient.setServer(host, port);
   mqttClient.setCallback(mqttCallback);
 
@@ -404,6 +678,7 @@ bool activateDevice() {
   String clientId = jsonExtractString(body, "client_id");
   String mUser = jsonExtractString(body, "username");
   String mPass = jsonExtractString(body, "password");
+  String mPath = jsonExtractString(body, "path");
   String topicCmd = jsonExtractString(body, "cmd");
   String topicRes = jsonExtractString(body, "res");
   String topicPing = jsonExtractString(body, "ping");
@@ -419,6 +694,7 @@ bool activateDevice() {
   memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
   memset(cfg.mqttUser, 0, sizeof(cfg.mqttUser));
   memset(cfg.mqttPass, 0, sizeof(cfg.mqttPass));
+  memset(cfg.mqttPath, 0, sizeof(cfg.mqttPath));
   memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
   memset(cfg.mqttTopicRes, 0, sizeof(cfg.mqttTopicRes));
   memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
@@ -435,6 +711,9 @@ bool activateDevice() {
   }
   if (mPass.length() > 0) {
     mPass.toCharArray(cfg.mqttPass, sizeof(cfg.mqttPass));
+  }
+  if (mPath.length() > 0) {
+    mPath.toCharArray(cfg.mqttPath, sizeof(cfg.mqttPath));
   }
 
   topicCmd.toCharArray(cfg.mqttTopicCmd, sizeof(cfg.mqttTopicCmd));
