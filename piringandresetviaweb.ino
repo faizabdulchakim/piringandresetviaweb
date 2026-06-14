@@ -7,13 +7,13 @@
 
 #define EEPROM_SIZE 1024
 #define CONFIG_MAGIC 0xA5
-#define CONFIG_VERSION 1
+#define CONFIG_VERSION 2
 
 ESP8266WebServer server(80);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-const char* API_ACTIVATE_URL = "https://solder.id/apici/index.php/device/activate";
+const char* API_ACTIVATE_URL = "";
 
 // Hardware identity: harus unik per device saat produksi.
 const char* HW_DEVICE_ID = "ESP32-001";
@@ -39,6 +39,7 @@ struct DeviceConfig {
   char mqttTopicPing[129];
   char mqttTopicPong[129];
   uint8_t isPaired;
+  char apiUrl[129];
 };
 
 DeviceConfig cfg;
@@ -339,18 +340,28 @@ bool activateDevice() {
     return false;
   }
 
-  Serial.println("Activating device to API...");
+  String activationUrl = strlen(cfg.apiUrl) > 0 ? String(cfg.apiUrl) : String(API_ACTIVATE_URL);
+  Serial.print("Activating device to: ");
+  Serial.println(activationUrl);
 
+  HTTPClient http;
+  bool ok = false;
   WiFiClientSecure secureClient;
-  secureClient.setInsecure();
+  WiFiClient client;
 
-  HTTPClient https;
-  if (!https.begin(secureClient, API_ACTIVATE_URL)) {
-    Serial.println("HTTPS begin failed");
+  if (activationUrl.startsWith("https://")) {
+    secureClient.setInsecure();
+    ok = http.begin(secureClient, activationUrl);
+  } else {
+    ok = http.begin(client, activationUrl);
+  }
+
+  if (!ok) {
+    Serial.println("HTTP/HTTPS begin failed");
     return false;
   }
 
-  https.addHeader("Content-Type", "application/json");
+  http.addHeader("Content-Type", "application/json");
 
   String payload = "{";
   payload += "\"pair_token\":\"" + String(cfg.pairToken) + "\",";
@@ -359,13 +370,22 @@ bool activateDevice() {
   payload += "\"hardware_password\":\"" + String(HW_PASSWORD) + "\"";
   payload += "}";
 
-  int code = https.POST(payload);
-  String body = https.getString();
-  https.end();
+  int code = http.POST(payload);
+  String body = http.getString();
+  http.end();
 
   Serial.print("Activate status: ");
   Serial.println(code);
   Serial.println(body);
+
+  if (code == 401) {
+    Serial.println("Invalid or expired pair token. Resetting config and rebooting to AP mode...");
+    clearConfig();
+    saveConfig();
+    delay(1000);
+    ESP.restart();
+    return false;
+  }
 
   if (code < 200 || code >= 300) {
     return false;
@@ -416,11 +436,13 @@ bool activateDevice() {
 }
 
 void handleRoot() {
+  String currentApiUrl = strlen(cfg.apiUrl) > 0 ? String(cfg.apiUrl) : String(API_ACTIVATE_URL);
   String html = "<h2>WiFi Setup</h2>"
                 "<form method='POST' action='/save'>"
-                "SSID: <input name='ssid'><br>"
-                "Password: <input name='pass' type='password'><br><br>"
-                "Pair Token: <input name='pair_token'><br><br>"
+                "SSID: <input name='ssid' value='" + String(cfg.ssid) + "'><br>"
+                "Password: <input name='pass' value='" + String(cfg.pass) + "' type='password'><br><br>"
+                "Pair Token: <input name='pair_token' value='" + String(cfg.pairToken) + "'><br><br>"
+                "API URL: <input name='api_url' value='" + currentApiUrl + "' style='width: 300px;'><br><br>"
                 "<input type='submit' value='Save WiFi'>"
                 "</form>"
                 "<br><br>"
@@ -432,10 +454,12 @@ void handleSave() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   String pairToken = server.arg("pair_token");
+  String apiUrl = server.arg("api_url");
 
   ssid.trim();
   pass.trim();
   pairToken.trim();
+  apiUrl.trim();
 
   if (ssid.length() == 0) {
     server.send(400, "text/plain", "SSID is required");
@@ -445,6 +469,7 @@ void handleSave() {
   memset(cfg.ssid, 0, sizeof(cfg.ssid));
   memset(cfg.pass, 0, sizeof(cfg.pass));
   memset(cfg.pairToken, 0, sizeof(cfg.pairToken));
+  memset(cfg.apiUrl, 0, sizeof(cfg.apiUrl));
   memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
   memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
   memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
@@ -455,6 +480,7 @@ void handleSave() {
   ssid.toCharArray(cfg.ssid, sizeof(cfg.ssid));
   pass.toCharArray(cfg.pass, sizeof(cfg.pass));
   pairToken.toCharArray(cfg.pairToken, sizeof(cfg.pairToken));
+  apiUrl.toCharArray(cfg.apiUrl, sizeof(cfg.apiUrl));
   cfg.mqttPort = mqttPortFallback;
   cfg.isPaired = 0;
 
@@ -490,7 +516,7 @@ void startAP() {
   WiFi.softAPConfig(apIP, apIP, netMsk);
 
   // mulai AP
-  WiFi.softAP("MyDevice_Setup", "12345678");
+  WiFi.softAP("MyDevice_Setup");
   Serial.print("AP IP: ");
   Serial.println(WiFi.softAPIP());
 
