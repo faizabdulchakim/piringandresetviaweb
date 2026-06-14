@@ -7,7 +7,7 @@
 
 #define EEPROM_SIZE 1024
 #define CONFIG_MAGIC 0xA5
-#define CONFIG_VERSION 2
+#define CONFIG_VERSION 3
 
 ESP8266WebServer server(80);
 WiFiClient espClient;
@@ -20,10 +20,10 @@ const char* HW_DEVICE_ID = "ESP32-001";
 const char* HW_USERNAME = "esp32_user_001";
 const char* HW_PASSWORD = "esp-secret-001";
 
-const char* mqttHostFallback = "faizabdul.xyz";
+const char* mqttHostFallback = "";
 const uint16_t mqttPortFallback = 1883;
-const char* mqttUser = "robot";
-const char* mqttPass = "bismillah";
+const char* mqttUser = "";
+const char* mqttPass = "";
 
 struct DeviceConfig {
   uint8_t magic;
@@ -40,6 +40,8 @@ struct DeviceConfig {
   char mqttTopicPong[129];
   uint8_t isPaired;
   char apiUrl[129];
+  char mqttUser[33];
+  char mqttPass[65];
 };
 
 DeviceConfig cfg;
@@ -287,6 +289,9 @@ void connectMqtt() {
 
   const char* host = strlen(cfg.mqttHost) > 0 ? cfg.mqttHost : mqttHostFallback;
   uint16_t port = cfg.mqttPort > 0 ? cfg.mqttPort : mqttPortFallback;
+  const char* mUser = strlen(cfg.mqttUser) > 0 ? cfg.mqttUser : mqttUser;
+  const char* mPass = strlen(cfg.mqttPass) > 0 ? cfg.mqttPass : mqttPass;
+
   mqttClient.setServer(host, port);
   mqttClient.setCallback(mqttCallback);
 
@@ -299,8 +304,8 @@ void connectMqtt() {
 
     bool ok = mqttClient.connect(
       clientId.c_str(),
-      mqttUser,
-      mqttPass,
+      mUser,
+      mPass,
       cfg.mqttTopicPing,
       1,
       true,
@@ -397,6 +402,8 @@ bool activateDevice() {
 
   String host = jsonExtractString(body, "host");
   String clientId = jsonExtractString(body, "client_id");
+  String mUser = jsonExtractString(body, "username");
+  String mPass = jsonExtractString(body, "password");
   String topicCmd = jsonExtractString(body, "cmd");
   String topicRes = jsonExtractString(body, "res");
   String topicPing = jsonExtractString(body, "ping");
@@ -410,6 +417,8 @@ bool activateDevice() {
 
   memset(cfg.mqttHost, 0, sizeof(cfg.mqttHost));
   memset(cfg.mqttClientId, 0, sizeof(cfg.mqttClientId));
+  memset(cfg.mqttUser, 0, sizeof(cfg.mqttUser));
+  memset(cfg.mqttPass, 0, sizeof(cfg.mqttPass));
   memset(cfg.mqttTopicCmd, 0, sizeof(cfg.mqttTopicCmd));
   memset(cfg.mqttTopicRes, 0, sizeof(cfg.mqttTopicRes));
   memset(cfg.mqttTopicPing, 0, sizeof(cfg.mqttTopicPing));
@@ -420,6 +429,12 @@ bool activateDevice() {
   }
   if (clientId.length() > 0) {
     clientId.toCharArray(cfg.mqttClientId, sizeof(cfg.mqttClientId));
+  }
+  if (mUser.length() > 0) {
+    mUser.toCharArray(cfg.mqttUser, sizeof(cfg.mqttUser));
+  }
+  if (mPass.length() > 0) {
+    mPass.toCharArray(cfg.mqttPass, sizeof(cfg.mqttPass));
   }
 
   topicCmd.toCharArray(cfg.mqttTopicCmd, sizeof(cfg.mqttTopicCmd));
