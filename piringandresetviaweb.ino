@@ -5,9 +5,9 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 
-#define EEPROM_SIZE 1024
+#define EEPROM_SIZE 2048
 #define CONFIG_MAGIC 0xA5
-#define CONFIG_VERSION 4
+#define CONFIG_VERSION 6
 
 // ==========================================
 // CLASS WRAPPER: WEBSOCKET SECURE (WSS)
@@ -324,6 +324,7 @@ struct DeviceConfig {
   char mqttUser[33];
   char mqttPass[65];
   char mqttPath[65];
+  uint8_t bootCount;
 };
 
 DeviceConfig cfg;
@@ -331,12 +332,7 @@ DeviceConfig cfg;
 unsigned long lastPingMs = 0;
 unsigned long lastActivationAttemptMs = 0;
 const int WIFI_CONNECT_RETRIES = 60;  // 60 x 500ms = 30s
-
-bool isExternalResetButtonPress() {
-  String reason = ESP.getResetReason();
-  reason.toLowerCase();
-  return reason.indexOf("external") >= 0;
-}
+bool bootCountCleared = false;
 
 const char* wifiStatusToText(int status) {
   switch (status) {
@@ -942,13 +938,22 @@ void setup() {
   Serial.println();
   Serial.println("Booting...");
 
-  if (isExternalResetButtonPress()) {
-    Serial.println("External reset detected. Running factory reset logic...");
+  // Load config first to read bootCount
+  loadConfig();
+
+  // Increment bootCount on startup
+  cfg.bootCount++;
+  Serial.print("Boot count: ");
+  Serial.println(cfg.bootCount);
+
+  if (cfg.bootCount >= 5) {
+    Serial.println("5x power cycles detected! Factory resetting...");
     clearConfig();
     saveConfig();
+    // After reset, ssid is empty, so it will fall through to startAP()
+  } else {
+    saveConfig();
   }
-
-  loadConfig();
 
   if (strlen(cfg.ssid) > 0) {
     Serial.print("Trying to connect to saved WiFi: ");
@@ -991,14 +996,30 @@ void setup() {
     Serial.println();
     Serial.print("WiFi connect failed. Last status: ");
     Serial.println(wifiStatusToText(WiFi.status()));
+    Serial.println("Auto-reconnect is active in background. AP mode will NOT start.");
+    
+    // Still initialize web server and routes in case it connects in background
+    setupWebRoutes();
+    server.begin();
+    return;
   }
 
-  // kalau gagal connect, masuk AP
+  // Kalau SSID kosong (belum diset / baru direset), masuk AP
   startAP();
 }
 
 void loop() {
   server.handleClient(); // selalu layani web server
+
+  // Reset bootCount to 0 after 3 seconds of stable uptime
+  if (!bootCountCleared && millis() > 3000) {
+    bootCountCleared = true;
+    if (cfg.bootCount > 0) {
+      cfg.bootCount = 0;
+      saveConfig();
+      Serial.println("Normal uptime reached. Boot count reset to 0.");
+    }
+  }
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!cfg.isPaired && strlen(cfg.pairToken) > 0 && (millis() - lastActivationAttemptMs >= 10000)) {
