@@ -507,10 +507,10 @@ void runMotor1Forward() { digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH);
 void runMotor1Backward() { digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW); }
 void runMotor2Forward() { digitalWrite(pinIN3, LOW); digitalWrite(pinIN4, HIGH); }
 void runMotor2Backward() { digitalWrite(pinIN3, HIGH); digitalWrite(pinIN4, LOW); }
-void runMotor3Forward() { digitalWrite(pinIN5, LOW); digitalWrite(pinIN6, HIGH); }
-void runMotor3Backward() { digitalWrite(pinIN5, HIGH); digitalWrite(pinIN6, LOW); }
-void runMotor4Forward() { digitalWrite(pinIN7, LOW); digitalWrite(pinIN8, HIGH); }
-void runMotor4Backward() { digitalWrite(pinIN7, HIGH); digitalWrite(pinIN8, LOW); }
+void runMotor3Forward() { digitalWrite(pinIN7, LOW); digitalWrite(pinIN8, HIGH); }
+void runMotor3Backward() { digitalWrite(pinIN7, HIGH); digitalWrite(pinIN8, LOW); }
+void runMotor4Forward() { digitalWrite(pinIN5, LOW); digitalWrite(pinIN6, HIGH); }
+void runMotor4Backward() { digitalWrite(pinIN5, HIGH); digitalWrite(pinIN6, LOW); }
 void stopMotor() {
   digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, HIGH);
   digitalWrite(pinIN3, HIGH); digitalWrite(pinIN4, HIGH);
@@ -526,12 +526,12 @@ void handleMqttCommand(const String& commandPayload) {
   action.trim();
   action.toLowerCase();
 
-  // Serial.print("MQTT command payload: ");
-  // Serial.println(commandPayload);
+  Serial.print("MQTT command payload: ");
+  Serial.println(commandPayload);
 
   // Perintah Pengendalian Motor Robot (RC Car)
   if (action == "maju") {
-    // Serial.println("Robot Action: MAJU");
+    Serial.println("Robot Action: MAJU");
     stopMotor();
     runMotor1Forward();
     runMotor2Forward();
@@ -539,7 +539,7 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor4Forward();
     return;
   } else if (action == "mundur") {
-    // Serial.println("Robot Action: MUNDUR");
+    Serial.println("Robot Action: MUNDUR");
     stopMotor();
     runMotor1Backward();
     runMotor2Backward();
@@ -547,31 +547,31 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor4Backward();
     return;
   } else if (action == "depankanan") {
-    // Serial.println("Robot Action: DEPAN KANAN");
+    Serial.println("Robot Action: DEPAN KANAN");
     stopMotor();
     runMotor1Forward();
     runMotor3Forward();
     return;
   } else if (action == "depankiri") {
-    // Serial.println("Robot Action: DEPAN KIRI");
+    Serial.println("Robot Action: DEPAN KIRI");
     stopMotor();
     runMotor2Forward();
     runMotor4Forward();
     return;
   } else if (action == "belakangkanan") {
-    // Serial.println("Robot Action: BELAKANG KANAN");
+    Serial.println("Robot Action: BELAKANG KANAN");
     stopMotor();
     runMotor1Backward();
     runMotor3Backward();
     return;
   } else if (action == "belakangkiri") {
-    // Serial.println("Robot Action: BELAKANG KIRI");
+    Serial.println("Robot Action: BELAKANG KIRI");
     stopMotor();
     runMotor2Backward();
     runMotor4Backward();
     return;
   } else if (action == "putarkanan") {
-    // Serial.println("Robot Action: PUTAR KANAN");
+    Serial.println("Robot Action: PUTAR KANAN");
     stopMotor();
     runMotor2Backward();
     runMotor4Backward();
@@ -579,7 +579,7 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor3Forward();
     return;
   } else if (action == "putarkiri") {
-    // Serial.println("Robot Action: PUTAR KIRI");
+    Serial.println("Robot Action: PUTAR KIRI");
     stopMotor();
     runMotor2Forward();
     runMotor4Forward();
@@ -587,7 +587,7 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor3Backward();
     return;
   } else if (action == "geserkanan") {
-    // Serial.println("Robot Action: GESER KANAN");
+    Serial.println("Robot Action: GESER KANAN");
     stopMotor();
     runMotor1Backward();
     runMotor3Forward();
@@ -595,7 +595,7 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor4Backward();
     return;
   } else if (action == "geserkiri") {
-    // Serial.println("Robot Action: GESER KIRI");
+    Serial.println("Robot Action: GESER KIRI");
     stopMotor();
     runMotor1Forward();
     runMotor3Backward();
@@ -603,7 +603,7 @@ void handleMqttCommand(const String& commandPayload) {
     runMotor4Forward();
     return;
   } else if (action == "berhenti") {
-    // Serial.println("Robot Action: BERHENTI");
+    Serial.println("Robot Action: BERHENTI");
     stopMotor();
     return;
   }
@@ -637,8 +637,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   msg.trim();
 
-  // Serial.print("MQTT recv: ");
-  // Serial.println(msg);
+  Serial.print("MQTT recv: ");
+  Serial.println(msg);
 
   if (strlen(cfg.mqttTopicCmd) > 0 && strcmp(topic, cfg.mqttTopicCmd) == 0) {
     handleMqttCommand(msg);
@@ -647,7 +647,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   if (strlen(cfg.mqttTopicPong) > 0 && strcmp(topic, cfg.mqttTopicPong) == 0) {
     msg.toLowerCase();
-    // Serial.println("MQTT pong received");
+    Serial.println("MQTT pong received");
   }
 }
 
@@ -675,7 +675,7 @@ void connectMqtt() {
       ? String(cfg.mqttClientId)
       : "esp8266-" + String(ESP.getChipId(), HEX);
 
-    // Serial.print("Connecting MQTT...");
+    Serial.print("Connecting MQTT...");
 
     bool ok = mqttClient.connect(
       clientId.c_str(),
@@ -688,17 +688,17 @@ void connectMqtt() {
     );
 
     if (ok) {
-      // Serial.println("connected");
+      Serial.println("connected");
       mqttClient.subscribe(cfg.mqttTopicCmd);
       mqttClient.subscribe(cfg.mqttTopicPong);
       publishMqtt("ping");
-      // Serial.println("MQTT send: ping");
+      Serial.println("MQTT send: ping");
       break;
     }
 
-    // Serial.print("failed, rc=");
-    // Serial.print(mqttClient.state());
-    // Serial.println(" retry in 3 seconds");
+    Serial.print("failed, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" retry in 3 seconds");
     delay(3000);
   }
 }
@@ -716,13 +716,13 @@ bool activateDevice() {
   }
 
   if (strlen(cfg.pairToken) == 0) {
-    // Serial.println("No pair token. Skip activation.");
+    Serial.println("No pair token. Skip activation.");
     return false;
   }
 
   String activationUrl = strlen(cfg.apiUrl) > 0 ? String(cfg.apiUrl) : String(API_ACTIVATE_URL);
-  // Serial.print("Activating device to: ");
-  // Serial.println(activationUrl);
+  Serial.print("Activating device to: ");
+  Serial.println(activationUrl);
 
   HTTPClient http;
   bool ok = false;
@@ -737,7 +737,7 @@ bool activateDevice() {
   }
 
   if (!ok) {
-    // Serial.println("HTTP/HTTPS begin failed");
+    Serial.println("HTTP/HTTPS begin failed");
     return false;
   }
 
@@ -754,12 +754,12 @@ bool activateDevice() {
   String body = http.getString();
   http.end();
 
-  // Serial.print("Activate status: ");
-  // Serial.println(code);
-  // Serial.println(body);
+  Serial.print("Activate status: ");
+  Serial.println(code);
+  Serial.println(body);
 
   if (code == 401) {
-    // Serial.println("Invalid or expired pair token. Resetting config and rebooting to AP mode...");
+    Serial.println("Invalid or expired pair token. Resetting config and rebooting to AP mode...");
     clearConfig();
     saveConfig();
     delay(1000);
@@ -787,7 +787,7 @@ bool activateDevice() {
   long port = jsonExtractNumber(body, "port", mqttPortFallback);
 
   if (topicCmd.length() == 0 || topicPing.length() == 0 || topicPong.length() == 0) {
-    // Serial.println("Activation response missing topics");
+    Serial.println("Activation response missing topics");
     return false;
   }
 
@@ -826,7 +826,7 @@ bool activateDevice() {
   cfg.isPaired = 1;
 
   saveConfig();
-  // Serial.println("Activation success. MQTT contract saved.");
+  Serial.println("Activation success. MQTT contract saved.");
   return true;
 }
 
@@ -903,7 +903,7 @@ void handleClearPairingHistory() {
 }
 
 void startAP() {
-  // Serial.println("\nFailed to connect. Starting AP mode...");
+  Serial.println("\nFailed to connect. Starting AP mode...");
 
   // IP untuk AP mode
   IPAddress apIP(192, 168, 4, 1);
@@ -912,13 +912,13 @@ void startAP() {
 
   // mulai AP
   WiFi.softAP("MyDevice_Setup");
-  // Serial.print("AP IP: ");
-  // Serial.println(WiFi.softAPIP());
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
 
   // web server routes
   setupWebRoutes();
   server.begin();
-  // Serial.println("Web server started");
+  Serial.println("Web server started");
 }
 
 void setup() {
@@ -932,22 +932,22 @@ void setup() {
   pinMode(pinIN8, OUTPUT);
   stopMotor();
 
-  // Serial.begin(115200);
+  Serial.begin(115200);
   delay(500);
 
-  // Serial.println();
-  // Serial.println("Booting...");
+  Serial.println();
+  Serial.println("Booting...");
 
   // Load config first to read bootCount
   loadConfig();
 
   // Increment bootCount on startup
   cfg.bootCount++;
-  // Serial.print("Boot count: ");
-  // Serial.println(cfg.bootCount);
+  Serial.print("Boot count: ");
+  Serial.println(cfg.bootCount);
 
   if (cfg.bootCount >= 5) {
-    // Serial.println("5x power cycles detected! Factory resetting...");
+    Serial.println("5x power cycles detected! Factory resetting...");
     clearConfig();
     saveConfig();
     // After reset, ssid is empty, so it will fall through to startAP()
@@ -956,8 +956,8 @@ void setup() {
   }
 
   if (strlen(cfg.ssid) > 0) {
-    // Serial.print("Trying to connect to saved WiFi: ");
-    // Serial.println(cfg.ssid);
+    Serial.print("Trying to connect to saved WiFi: ");
+    Serial.println(cfg.ssid);
 
     WiFi.mode(WIFI_STA);
     WiFi.disconnect();
@@ -967,19 +967,19 @@ void setup() {
     int retries = 0;
     while (WiFi.status() != WL_CONNECTED && retries < WIFI_CONNECT_RETRIES) {
       delay(500);
-      // Serial.print(".");
+      Serial.print(".");
       if ((retries + 1) % 10 == 0) {
-        // Serial.print(" [");
-        // Serial.print(wifiStatusToText(WiFi.status()));
-        // Serial.print("]");
+        Serial.print(" [");
+        Serial.print(wifiStatusToText(WiFi.status()));
+        Serial.print("]");
       }
       retries++;
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-      // Serial.println("\nConnected to WiFi!");
-      // Serial.print("IP Address: ");
-      // Serial.println(WiFi.localIP());
+      Serial.println("\nConnected to WiFi!");
+      Serial.print("IP Address: ");
+      Serial.println(WiFi.localIP());
 
       if (!cfg.isPaired && strlen(cfg.pairToken) > 0) {
         activateDevice();
@@ -993,10 +993,10 @@ void setup() {
       return;
     }
 
-    // Serial.println();
-    // Serial.print("WiFi connect failed. Last status: ");
-    // Serial.println(wifiStatusToText(WiFi.status()));
-    // Serial.println("Auto-reconnect is active in background. AP mode will NOT start.");
+    Serial.println();
+    Serial.print("WiFi connect failed. Last status: ");
+    Serial.println(wifiStatusToText(WiFi.status()));
+    Serial.println("Auto-reconnect is active in background. AP mode will NOT start.");
     
     // Still initialize web server and routes in case it connects in background
     setupWebRoutes();
@@ -1017,7 +1017,7 @@ void loop() {
     if (cfg.bootCount > 0) {
       cfg.bootCount = 0;
       saveConfig();
-      // Serial.println("Normal uptime reached. Boot count reset to 0.");
+      Serial.println("Normal uptime reached. Boot count reset to 0.");
     }
   }
 
