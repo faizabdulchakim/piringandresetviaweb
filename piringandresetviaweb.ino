@@ -503,19 +503,19 @@ void publishCommandResponse(const String& action, const String& status, const St
   publishMqttToTopic(cfg.mqttTopicRes, payload, false);
 }
 
-void runMotor1Forward() { digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW); }
-void runMotor1Backward() { digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH); }
-void runMotor2Forward() { digitalWrite(pinIN3, HIGH); digitalWrite(pinIN4, LOW); }
-void runMotor2Backward() { digitalWrite(pinIN3, LOW); digitalWrite(pinIN4, HIGH); }
-void runMotor3Forward() { digitalWrite(pinIN5, HIGH); digitalWrite(pinIN6, LOW); }
-void runMotor3Backward() { digitalWrite(pinIN5, LOW); digitalWrite(pinIN6, HIGH); }
-void runMotor4Forward() { digitalWrite(pinIN7, HIGH); digitalWrite(pinIN8, LOW); }
-void runMotor4Backward() { digitalWrite(pinIN7, LOW); digitalWrite(pinIN8, HIGH); }
+void runMotor1Forward() { digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH); }
+void runMotor1Backward() { digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW); }
+void runMotor2Forward() { digitalWrite(pinIN3, LOW); digitalWrite(pinIN4, HIGH); }
+void runMotor2Backward() { digitalWrite(pinIN3, HIGH); digitalWrite(pinIN4, LOW); }
+void runMotor3Forward() { digitalWrite(pinIN5, LOW); digitalWrite(pinIN6, HIGH); }
+void runMotor3Backward() { digitalWrite(pinIN5, HIGH); digitalWrite(pinIN6, LOW); }
+void runMotor4Forward() { digitalWrite(pinIN7, LOW); digitalWrite(pinIN8, HIGH); }
+void runMotor4Backward() { digitalWrite(pinIN7, HIGH); digitalWrite(pinIN8, LOW); }
 void stopMotor() {
-  digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, LOW);
-  digitalWrite(pinIN3, LOW); digitalWrite(pinIN4, LOW);
-  digitalWrite(pinIN5, LOW); digitalWrite(pinIN6, LOW);
-  digitalWrite(pinIN7, LOW); digitalWrite(pinIN8, LOW);
+  digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, HIGH);
+  digitalWrite(pinIN3, HIGH); digitalWrite(pinIN4, HIGH);
+  digitalWrite(pinIN5, HIGH); digitalWrite(pinIN6, HIGH);
+  digitalWrite(pinIN7, HIGH); digitalWrite(pinIN8, HIGH);
 }
 
 void handleMqttCommand(const String& commandPayload) {
@@ -561,46 +561,46 @@ void handleMqttCommand(const String& commandPayload) {
   } else if (action == "belakangkanan") {
     // Serial.println("Robot Action: BELAKANG KANAN");
     stopMotor();
-    runMotor2Backward();
-    runMotor4Backward();
+    runMotor1Backward();
+    runMotor3Backward();
     return;
   } else if (action == "belakangkiri") {
     // Serial.println("Robot Action: BELAKANG KIRI");
     stopMotor();
-    runMotor1Backward();
-    runMotor3Backward();
+    runMotor2Backward();
+    runMotor4Backward();
     return;
   } else if (action == "putarkanan") {
     // Serial.println("Robot Action: PUTAR KANAN");
     stopMotor();
-    runMotor1Backward();
-    runMotor3Backward();
-    runMotor2Forward();
-    runMotor4Forward();
+    runMotor2Backward();
+    runMotor4Backward();
+    runMotor1Forward();
+    runMotor3Forward();
     return;
   } else if (action == "putarkiri") {
     // Serial.println("Robot Action: PUTAR KIRI");
     stopMotor();
-    runMotor1Forward();
-    runMotor3Forward();
-    runMotor2Backward();
-    runMotor4Backward();
+    runMotor2Forward();
+    runMotor4Forward();
+    runMotor1Backward();
+    runMotor3Backward();
     return;
   } else if (action == "geserkanan") {
     // Serial.println("Robot Action: GESER KANAN");
-    stopMotor();
-    runMotor1Forward();
-    runMotor3Backward();
-    runMotor2Backward();
-    runMotor4Forward();
-    return;
-  } else if (action == "geserkiri") {
-    // Serial.println("Robot Action: GESER KIRI");
     stopMotor();
     runMotor1Backward();
     runMotor3Forward();
     runMotor2Forward();
     runMotor4Backward();
+    return;
+  } else if (action == "geserkiri") {
+    // Serial.println("Robot Action: GESER KIRI");
+    stopMotor();
+    runMotor1Forward();
+    runMotor3Backward();
+    runMotor2Backward();
+    runMotor4Forward();
     return;
   } else if (action == "berhenti") {
     // Serial.println("Robot Action: BERHENTI");
