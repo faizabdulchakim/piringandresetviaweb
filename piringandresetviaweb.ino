@@ -830,6 +830,91 @@ bool activateDevice() {
   return true;
 }
 
+bool checkCloudStatus() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return false;
+  }
+
+  if (!cfg.isPaired) {
+    return false;
+  }
+
+  String activationUrl = strlen(cfg.apiUrl) > 0 ? String(cfg.apiUrl) : String(API_ACTIVATE_URL);
+  if (activationUrl.length() == 0) {
+    return false;
+  }
+
+  String statusUrl = activationUrl;
+  if (statusUrl.endsWith("/activate")) {
+    statusUrl.replace("/activate", "/check_status");
+  } else {
+    statusUrl = statusUrl + "/../check_status";
+  }
+
+  Serial.print("Checking cloud status at: ");
+  Serial.println(statusUrl);
+
+  HTTPClient http;
+  bool ok = false;
+  WiFiClientSecure secureClient;
+  WiFiClient client;
+
+  if (statusUrl.startsWith("https://")) {
+    secureClient.setInsecure();
+    ok = http.begin(secureClient, statusUrl);
+  } else {
+    ok = http.begin(client, statusUrl);
+  }
+
+  if (!ok) {
+    Serial.println("HTTP/HTTPS status check begin failed");
+    return false;
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  String payload = "{";
+  payload += "\"device_id\":\"" + String(HW_DEVICE_ID) + "\",";
+  payload += "\"hardware_username\":\"" + String(HW_USERNAME) + "\",";
+  payload += "\"hardware_password\":\"" + String(HW_PASSWORD) + "\"";
+  payload += "}";
+
+  int code = http.POST(payload);
+  String body = http.getString();
+  http.end();
+
+  Serial.print("Status check response code: ");
+  Serial.println(code);
+  Serial.println(body);
+
+  if (code == 401 || code == 404) {
+    Serial.println("Device credentials rejected by server. Factory resetting...");
+    clearConfig();
+    saveConfig();
+    delay(1000);
+    ESP.restart();
+    return false;
+  }
+
+  if (code == 200) {
+    if (jsonContainsTrue(body, "status")) {
+      if (!jsonContainsTrue(body, "paired")) {
+        Serial.println("Device has been unpaired from cloud. Factory resetting...");
+        clearConfig();
+        saveConfig();
+        delay(1000);
+        ESP.restart();
+        return false;
+      } else {
+        Serial.println("Cloud status verified: Still paired.");
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 void handleRoot() {
   String currentApiUrl = strlen(cfg.apiUrl) > 0 ? String(cfg.apiUrl) : String(API_ACTIVATE_URL);
   String html = "<h2>WiFi Setup</h2>"
@@ -983,6 +1068,8 @@ void setup() {
 
       if (!cfg.isPaired && strlen(cfg.pairToken) > 0) {
         activateDevice();
+      } else if (cfg.isPaired) {
+        checkCloudStatus();
       }
 
       connectMqtt();
