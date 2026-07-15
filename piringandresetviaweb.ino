@@ -296,9 +296,9 @@ const int pinIN7 = D9; // d4 wemos  M4
 const int pinIN8 = D7; // d7 wemos  M4
 
 // Hardware identity: harus unik per device saat produksi.
-const char* HW_DEVICE_ID = "ESP32-001";
-const char* HW_USERNAME = "esp32_user_001";
-const char* HW_PASSWORD = "esp-secret-001";
+const char* HW_DEVICE_ID = "ESP32-002";
+const char* HW_USERNAME = "khodam2";
+const char* HW_PASSWORD = "azimat";
 
 const char* mqttHostFallback = "";
 const uint16_t mqttPortFallback = 1883;
