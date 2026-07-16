@@ -3,21 +3,285 @@
 #include <EEPROM.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
-#include <WebSocketsClient.h>
+#include <PubSubClient.h>
 
 #define EEPROM_SIZE 2048
 #define CONFIG_MAGIC 0xA5
 #define CONFIG_VERSION 6
 
+// ==========================================
+// CLASS WRAPPER: WEBSOCKET SECURE (WSS)
+// ==========================================
+class WSSMqttClient : public Client {
+private:
+    WiFiClientSecure client;
+    const char* host;
+    uint16_t port;
+    const char* path;
+    bool connected_ws = false;
+
+    // Ring Buffer untuk menampung data payload WebSocket yang masuk
+    uint8_t* rxBuf = nullptr;
+    const size_t rxBufSize = 1024;
+    size_t rxHead = 0; // Pointer tulis
+    size_t rxTail = 0; // Pointer baca
+
+    // Mengirim frame biner WebSocket (opcode 0x02) ke Broker
+    void sendFrame(const uint8_t* data, size_t len) {
+        if (!client.connected()) return;
+
+        // Header Frame: FIN (1) + Opcode Biner (2) = 0x82
+        uint8_t header = 0x82;
+        client.write(&header, 1);
+
+        // Masking key (wajib untuk data dari Client ke Server)
+        uint8_t mask[4] = { 
+            (uint8_t)random(256), 
+            (uint8_t)random(256), 
+            (uint8_t)random(256), 
+            (uint8_t)random(256) 
+        };
+
+        if (len < 126) {
+            uint8_t lenByte = 0x80 | (uint8_t)len;
+            client.write(&lenByte, 1);
+        } else if (len <= 65535) {
+            uint8_t lenByte = 0x80 | 126;
+            client.write(&lenByte, 1);
+            uint8_t lenBytes[2] = {
+                (uint8_t)(len >> 8),
+                (uint8_t)(len & 0xFF)
+            };
+            client.write(lenBytes, 2);
+        } else {
+            return; // Payload terlalu besar
+        }
+
+        client.write(mask, 4);
+
+        // Lakukan masking ke data sebelum dikirim
+        uint8_t* masked = (uint8_t*)malloc(len);
+        if (masked) {
+            for (size_t i = 0; i < len; i++) {
+                masked[i] = data[i] ^ mask[i % 4];
+            }
+            client.write(masked, len);
+            free(masked);
+        }
+    }
+
+    // Melakukan handshake HTTP Upgrade ke WebSocket
+    bool performHandshake() {
+        if (path == nullptr) return false;
+        String pathStr = String(path);
+        if (!pathStr.startsWith("/")) {
+            pathStr = "/" + pathStr;
+        }
+
+        String req = "GET " + pathStr + " HTTP/1.1\r\n";
+        req += "Host: " + String(host) + ":" + String(port) + "\r\n";
+        req += "Upgrade: websocket\r\n";
+        req += "Connection: Upgrade\r\n";
+        req += "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"; // Kunci statis standar
+        req += "Sec-WebSocket-Protocol: mqtt\r\n"; // Menggunakan sub-protokol mqtt
+        req += "Sec-WebSocket-Version: 13\r\n\r\n";
+
+        client.print(req);
+
+        // Baca header respons
+        unsigned long start = millis();
+        String response = "";
+        while (client.connected() && millis() - start < 5000) {
+            if (client.available()) {
+                char c = client.read();
+                response += c;
+                if (response.endsWith("\r\n\r\n")) {
+                    break;
+                }
+            }
+            yield();
+        }
+
+        // Cek status code 101 Switching Protocols
+        if (response.indexOf("101 Switching Protocols") >= 0 || response.indexOf("101 ") >= 0) {
+            connected_ws = true;
+            rxHead = 0;
+            rxTail = 0;
+            return true;
+        }
+
+        client.stop();
+        return false;
+    }
+
+    // Membaca stream TCP dan mengekstrak payload dari frame WebSocket
+    void parseIncoming() {
+        if (!client.connected()) {
+            connected_ws = false;
+            return;
+        }
+
+        while (client.available() >= 2) {
+            uint8_t header = client.read();
+            uint8_t lenByte = client.read();
+
+            uint8_t opcode = header & 0x0F;
+            bool masked = (lenByte & 0x80) != 0;
+            uint32_t payloadLen = lenByte & 0x7F;
+
+            if (payloadLen == 126) {
+                unsigned long start = millis();
+                while (client.available() < 2) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                payloadLen = (client.read() << 8) | client.read();
+            } else if (payloadLen == 127) {
+                unsigned long start = millis();
+                while (client.available() < 8) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                payloadLen = 0;
+                for (int i = 0; i < 8; i++) {
+                    payloadLen = (payloadLen << 8) | client.read();
+                }
+            }
+
+            uint8_t maskKey[4] = {0};
+            if (masked) {
+                unsigned long start = millis();
+                while (client.available() < 4) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                client.read(maskKey, 4);
+            }
+
+            // Baca payload data
+            for (uint32_t i = 0; i < payloadLen; i++) {
+                unsigned long start = millis();
+                while (!client.available()) {
+                    if (!client.connected() || (millis() - start > 2000)) return;
+                    yield();
+                }
+                uint8_t val = client.read();
+                if (masked) {
+                    val ^= maskKey[i % 4];
+                }
+
+                // Masukkan data frame text/binary/continuation ke dalam ring buffer baca
+                if (opcode == 0x00 || opcode == 0x01 || opcode == 0x02) {
+                    size_t nextHead = (rxHead + 1) % rxBufSize;
+                    if (nextHead != rxTail) {
+                        rxBuf[rxHead] = val;
+                        rxHead = nextHead;
+                    }
+                }
+            }
+
+            // Tangani frame khusus WebSocket
+            if (opcode == 0x08) { // Frame Close
+                connected_ws = false;
+                client.stop();
+                return;
+            } else if (opcode == 0x09) { // Frame Ping -> Jawab dengan Pong
+                uint8_t pongFrame[2] = { 0x8A, 0x00 };
+                client.write(pongFrame, 2);
+            }
+        }
+    }
+
+public:
+    WSSMqttClient(const char* h, uint16_t p, const char* pathStr) 
+      : host(h), port(p), path(pathStr) {
+        rxBuf = (uint8_t*)malloc(rxBufSize);
+        
+        // Lewati verifikasi sertifikat root CA
+        // Ini menghindari perlunya sinkronisasi waktu lewat NTP.
+        client.setInsecure();
+    }
+
+    ~WSSMqttClient() {
+        if (rxBuf) free(rxBuf);
+    }
+
+    void setDestination(const char* h, uint16_t p, const char* pathStr) {
+        host = h;
+        port = p;
+        path = pathStr;
+    }
+
+    int connect(IPAddress ip, uint16_t port) override { return 0; }
+    int connect(const char *host, uint16_t port) override {
+        connected_ws = false;
+        this->host = host;
+        this->port = port;
+        if (client.connect(host, port)) {
+            return performHandshake() ? 1 : 0;
+        }
+        return 0;
+    }
+
+    size_t write(uint8_t b) override {
+        return write(&b, 1);
+    }
+
+    size_t write(const uint8_t *buf, size_t size) override {
+        sendFrame(buf, size);
+        return size;
+    }
+
+    int available() override {
+        parseIncoming();
+        return (rxHead >= rxTail) ? (rxHead - rxTail) : (rxBufSize - rxTail + rxHead);
+    }
+
+    int read() override {
+        parseIncoming();
+        if (rxHead == rxTail) return -1;
+        uint8_t val = rxBuf[rxTail];
+        rxTail = (rxTail + 1) % rxBufSize;
+        return val;
+    }
+
+    int read(uint8_t *buf, size_t size) override {
+        size_t bytesRead = 0;
+        while (bytesRead < size) {
+            int val = read();
+            if (val == -1) break;
+            buf[bytesRead++] = (uint8_t)val;
+        }
+        return bytesRead;
+    }
+
+    int peek() override {
+        parseIncoming();
+        if (rxHead == rxTail) return -1;
+        return rxBuf[rxTail];
+    }
+
+    void flush() override {
+        client.flush();
+    }
+
+    void stop() override {
+        connected_ws = false;
+        client.stop();
+    }
+
+    uint8_t connected() override {
+        return (client.connected() && connected_ws) ? 1 : 0;
+    }
+
+    operator bool() override {
+        return connected() == 1;
+    }
+};
+
 ESP8266WebServer server(80);
-WebSocketsClient webSocket;
-bool mqttConnected = false;
-bool mqttWsConfigured = false;
-uint16_t mqttPacketId = 1;
-unsigned long lastMqttKeepaliveMs = 0;
-String mqttWsHostRuntime = "";
-String mqttWsPathRuntime = "";
-uint16_t mqttWsPortRuntime = 0;
+WSSMqttClient wssClient(nullptr, 0, nullptr);
+PubSubClient mqttClient(wssClient);
 
 const char* API_ACTIVATE_URL = "";
 
@@ -212,104 +476,18 @@ void loadConfig() {
   }
 }
 
-void appendString(uint8_t* packet, int& pos, const char* value) {
-  if (value == nullptr) value = "";
-  uint16_t len = strlen(value);
-  packet[pos++] = len >> 8;
-  packet[pos++] = len & 0xFF;
-  memcpy(packet + pos, value, len);
-  pos += len;
-}
-
-int appendRemainingLength(uint8_t* packet, int pos, int length) {
-  do {
-    uint8_t encodedByte = length % 128;
-    length /= 128;
-    if (length > 0) encodedByte |= 128;
-    packet[pos++] = encodedByte;
-  } while (length > 0);
-  return pos;
-}
-
-void sendMqttPacket(uint8_t packetType, const uint8_t* variableHeaderAndPayload, int bodyLength) {
-  uint8_t packet[768];
-  int pos = 0;
-  if (bodyLength > (int)sizeof(packet) - 5) return;
-  packet[pos++] = packetType;
-  pos = appendRemainingLength(packet, pos, bodyLength);
-  if (bodyLength > 0) {
-    memcpy(packet + pos, variableHeaderAndPayload, bodyLength);
-    pos += bodyLength;
+void publishMqtt(const char* payload) {
+  if (!mqttClient.connected()) {
+    return;
   }
-  webSocket.sendBIN(packet, pos);
-}
-
-void sendMqttConnect() {
-  uint8_t body[512];
-  int pos = 0;
-
-  String clientId = strlen(cfg.mqttClientId) > 0
-    ? String(cfg.mqttClientId)
-    : "esp8266-" + String(ESP.getChipId(), HEX);
-  const char* mUser = strlen(cfg.mqttUser) > 0 ? cfg.mqttUser : mqttUser;
-  const char* mPass = strlen(cfg.mqttPass) > 0 ? cfg.mqttPass : mqttPass;
-
-  appendString(body, pos, "MQTT");
-  body[pos++] = 4;
-  bool hasWill = strlen(cfg.mqttTopicPing) > 0;
-  uint8_t flags = 0x02; // clean session
-  if (hasWill) flags |= 0x2C; // will flag + QoS 1 + retain, like the previous PubSubClient connect()
-  if (mUser != nullptr && strlen(mUser) > 0) flags |= 0x80;
-  if (mPass != nullptr && strlen(mPass) > 0) flags |= 0x40;
-  body[pos++] = flags;
-  body[pos++] = 0;
-  body[pos++] = 60;
-  appendString(body, pos, clientId.c_str());
-  if (hasWill) {
-    appendString(body, pos, cfg.mqttTopicPing);
-    appendString(body, pos, "berhenti");
-  }
-  if (mUser != nullptr && strlen(mUser) > 0) appendString(body, pos, mUser);
-  if (mPass != nullptr && strlen(mPass) > 0) appendString(body, pos, mPass);
-
-  Serial.println("MQTT WS: sending CONNECT");
-  sendMqttPacket(0x10, body, pos);
-}
-
-void sendMqttSubscribe(const char* topic) {
-  if (topic == nullptr || strlen(topic) == 0) return;
-  uint8_t body[384];
-  int pos = 0;
-  uint16_t id = mqttPacketId++;
-
-  body[pos++] = id >> 8;
-  body[pos++] = id & 0xFF;
-  appendString(body, pos, topic);
-  body[pos++] = 0;
-
-  Serial.print("MQTT WS: subscribing to ");
-  Serial.println(topic);
-  sendMqttPacket(0x82, body, pos);
+  mqttClient.publish(cfg.mqttTopicPing, payload);
 }
 
 void publishMqttToTopic(const char* topic, const String& payload, bool retain = false) {
-  if (!mqttConnected || topic == nullptr || strlen(topic) == 0) return;
-  uint8_t body[768];
-  int pos = 0;
-  appendString(body, pos, topic);
-  int payloadLen = payload.length();
-  if (pos + payloadLen > (int)sizeof(body)) return;
-  memcpy(body + pos, payload.c_str(), payloadLen);
-  pos += payloadLen;
-  sendMqttPacket(retain ? 0x31 : 0x30, body, pos);
-}
-
-void publishMqtt(const char* payload) {
-  publishMqttToTopic(cfg.mqttTopicPing, String(payload), false);
-}
-
-void sendMqttKeepalivePing() {
-  sendMqttPacket(0xC0, nullptr, 0);
+  if (!mqttClient.connected() || topic == nullptr || strlen(topic) == 0) {
+    return;
+  }
+  mqttClient.publish(topic, payload.c_str(), retain);
 }
 
 void publishCommandResponse(const String& action, const String& status, const String& detail = "") {
@@ -452,100 +630,24 @@ void handleMqttCommand(const String& commandPayload) {
   publishCommandResponse(action, "error", "Unknown action");
 }
 
-int decodeRemainingLength(uint8_t* payload, size_t length, int& pos) {
-  int multiplier = 1;
-  int value = 0;
-  uint8_t encodedByte;
-
-  do {
-    if (pos >= (int)length) return -1;
-    encodedByte = payload[pos++];
-    value += (encodedByte & 127) * multiplier;
-    multiplier *= 128;
-  } while ((encodedByte & 128) != 0);
-
-  return value;
-}
-
-void handleMqttPacket(uint8_t* payload, size_t length) {
-  if (length < 2) return;
-
-  uint8_t packetType = payload[0] >> 4;
-  int pos = 1;
-  int remainingLength = decodeRemainingLength(payload, length, pos);
-  if (remainingLength < 0 || pos + remainingLength > (int)length) return;
-
-  if (packetType == 2) { // CONNACK
-    uint8_t returnCode = payload[pos + 1];
-    if (returnCode == 0) {
-      mqttConnected = true;
-      lastMqttKeepaliveMs = millis();
-      Serial.println("MQTT WS connected");
-      sendMqttSubscribe(cfg.mqttTopicCmd);
-      sendMqttSubscribe(cfg.mqttTopicPong);
-      publishMqtt("ping");
-      Serial.println("MQTT send: ping");
-    } else {
-      mqttConnected = false;
-      Serial.print("MQTT WS CONNACK failed, code=");
-      Serial.println(returnCode);
-    }
-  } else if (packetType == 3) { // PUBLISH QoS 0
-    if (pos + 2 > (int)length) return;
-    uint16_t topicLen = (payload[pos] << 8) | payload[pos + 1];
-    pos += 2;
-    if (pos + topicLen > (int)length) return;
-
-    String topic = "";
-    for (uint16_t i = 0; i < topicLen; i++) topic += (char)payload[pos++];
-
-    String message = "";
-    int endPos = 1;
-    decodeRemainingLength(payload, length, endPos);
-    endPos += remainingLength;
-    while (pos < endPos && pos < (int)length) message += (char)payload[pos++];
-    message.trim();
-
-    Serial.print("MQTT recv: ");
-    Serial.println(message);
-
-    if (strlen(cfg.mqttTopicCmd) > 0 && topic == String(cfg.mqttTopicCmd)) {
-      handleMqttCommand(message);
-      return;
-    }
-
-    if (strlen(cfg.mqttTopicPong) > 0 && topic == String(cfg.mqttTopicPong)) {
-      message.toLowerCase();
-      Serial.println("MQTT pong received");
-    }
-  } else if (packetType == 9) { // SUBACK
-    Serial.println("MQTT WS subscribed");
-  } else if (packetType == 13) { // PINGRESP
-    Serial.println("MQTT WS ping response");
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
   }
-}
+  msg.trim();
 
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_DISCONNECTED:
-      mqttConnected = false;
-      Serial.println("WebSocket disconnected");
-      break;
-    case WStype_CONNECTED:
-      mqttConnected = false;
-      Serial.println("WebSocket connected");
-      sendMqttConnect();
-      break;
-    case WStype_BIN:
-      handleMqttPacket(payload, length);
-      break;
-    case WStype_TEXT:
-      Serial.print("WebSocket text: ");
-      for (size_t i = 0; i < length; i++) Serial.print((char)payload[i]);
-      Serial.println();
-      break;
-    default:
-      break;
+  Serial.print("MQTT recv: ");
+  Serial.println(msg);
+
+  if (strlen(cfg.mqttTopicCmd) > 0 && strcmp(topic, cfg.mqttTopicCmd) == 0) {
+    handleMqttCommand(msg);
+    return;
+  }
+
+  if (strlen(cfg.mqttTopicPong) > 0 && strcmp(topic, cfg.mqttTopicPong) == 0) {
+    msg.toLowerCase();
+    Serial.println("MQTT pong received");
   }
 }
 
@@ -558,36 +660,47 @@ void connectMqtt() {
     return;
   }
 
-  if (mqttWsConfigured) {
-    return;
-  }
-
   const char* host = strlen(cfg.mqttHost) > 0 ? cfg.mqttHost : mqttHostFallback;
   uint16_t port = cfg.mqttPort > 0 ? cfg.mqttPort : mqttPortFallback;
   const char* path = strlen(cfg.mqttPath) > 0 ? cfg.mqttPath : mqttBasepathFallback;
+  const char* mUser = strlen(cfg.mqttUser) > 0 ? cfg.mqttUser : mqttUser;
+  const char* mPass = strlen(cfg.mqttPass) > 0 ? cfg.mqttPass : mqttPass;
 
-  if (host == nullptr || strlen(host) == 0) {
-    Serial.println("MQTT host is empty");
-    return;
+  wssClient.setDestination(host, port, path);
+  mqttClient.setServer(host, port);
+  mqttClient.setCallback(mqttCallback);
+
+  while (!mqttClient.connected()) {
+    String clientId = strlen(cfg.mqttClientId) > 0
+      ? String(cfg.mqttClientId)
+      : "esp8266-" + String(ESP.getChipId(), HEX);
+
+    Serial.print("Connecting MQTT...");
+
+    bool ok = mqttClient.connect(
+      clientId.c_str(),
+      mUser,
+      mPass,
+      cfg.mqttTopicPing,
+      1,
+      true,
+      "berhenti"
+    );
+
+    if (ok) {
+      Serial.println("connected");
+      mqttClient.subscribe(cfg.mqttTopicCmd);
+      mqttClient.subscribe(cfg.mqttTopicPong);
+      publishMqtt("ping");
+      Serial.println("MQTT send: ping");
+      break;
+    }
+
+    Serial.print("failed, rc=");
+    Serial.print(mqttClient.state());
+    Serial.println(" retry in 3 seconds");
+    delay(3000);
   }
-
-  mqttWsHostRuntime = String(host);
-  mqttWsPortRuntime = port;
-  mqttWsPathRuntime = String(path);
-  if (!mqttWsPathRuntime.startsWith("/")) {
-    mqttWsPathRuntime = "/" + mqttWsPathRuntime;
-  }
-
-  Serial.print("Connecting MQTT WS to ");
-  Serial.print(mqttWsHostRuntime);
-  Serial.print(":");
-  Serial.print(mqttWsPortRuntime);
-  Serial.println(mqttWsPathRuntime);
-
-  webSocket.beginSSL(mqttWsHostRuntime.c_str(), mqttWsPortRuntime, mqttWsPathRuntime.c_str(), NULL, "mqtt");
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);
-  mqttWsConfigured = true;
 }
 
 void setupWebRoutes() {
@@ -1001,18 +1114,13 @@ void loop() {
       activateDevice();
     }
 
-    connectMqtt();
-    if (mqttWsConfigured) {
-      webSocket.loop();
+    if (!mqttClient.connected()) {
+      connectMqtt();
     }
-
-    if (mqttConnected && millis() - lastMqttKeepaliveMs >= 30000) {
-      sendMqttKeepalivePing();
-      lastMqttKeepaliveMs = millis();
-    }
+    mqttClient.loop();
 
     // heartbeat ping berkala ke app
-    if (mqttConnected && millis() - lastPingMs >= 10000) {
+    if (millis() - lastPingMs >= 10000) {
       publishMqtt("ping");
       lastPingMs = millis();
     }
